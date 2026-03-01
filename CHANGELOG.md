@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.19.0 - 2026-02-28
+
+### New Features
+
+- Add wait-on-limit mode: automatic retry on rate limits with configurable duration (#168) @umputun
+
+### Improved
+
+- Add FAQ entry about using ralphex with Claude Pro plan
+- Document wait-on-limit feature
+
+### Fixed
+
+- Fix worktree mode rejecting non-main/master default branches (#165) @umputun
+
 ## v0.18.0 - 2026-02-26
 
 ### New Features
