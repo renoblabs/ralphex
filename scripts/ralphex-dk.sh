@@ -36,6 +36,7 @@ etc.) with explicit values. Values containing commas must use -E flag instead.
 """
 
 import argparse
+import dataclasses
 import difflib
 import hashlib
 import os
@@ -60,6 +61,33 @@ DEFAULT_IMAGE = "ghcr.io/umputun/ralphex-go:latest"
 DEFAULT_PORT = "8080"
 SCRIPT_URL = "https://raw.githubusercontent.com/umputun/ralphex/master/scripts/ralphex-dk.sh"
 SENSITIVE_PATTERNS = ["KEY", "SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"]
+VALID_CLAUDE_PROVIDERS = ["default", "bedrock"]
+
+# environment variables to pass through when using bedrock provider
+BEDROCK_ENV_VARS = [
+    # core bedrock config (auto-set to 1 when bedrock provider is selected)
+    "CLAUDE_CODE_USE_BEDROCK",
+    "AWS_REGION",
+    # explicit credentials (exported from profile or set directly by user)
+    # NOTE: AWS_PROFILE is NOT in this list - it requires ~/.aws/config which
+    # we don't mount. Profile is used on host only to export temp credentials.
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    # bedrock API key auth
+    "AWS_BEARER_TOKEN_BEDROCK",
+    # model configuration (for inference profiles, custom model ARNs)
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+    # optional
+    "DISABLE_PROMPT_CACHING",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,6 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="run embedded unit tests and exit")
     parser.add_argument("-h", "--help", action="store_true", dest="help",
                         help="show this help and ralphex help, then exit")
+    parser.add_argument("--claude-provider", dest="claude_provider", metavar="PROVIDER",
+                        choices=VALID_CLAUDE_PROVIDERS,
+                        help="claude provider: 'default' or 'bedrock' (env: RALPHEX_CLAUDE_PROVIDER)")
     return parser
 
 
@@ -449,6 +480,210 @@ def merge_volume_flags(args_volume: list[str]) -> list[str]:
     return result
 
 
+def get_claude_provider(cli_provider: Optional[str]) -> str:
+    """get claude provider from CLI flag or env var. returns 'default' or 'bedrock'.
+
+    priority: CLI flag > RALPHEX_CLAUDE_PROVIDER env var > 'default'
+    raises ValueError if provider value is invalid.
+    """
+    if cli_provider is not None:
+        return cli_provider  # already validated by argparse choices
+    env_provider = os.environ.get("RALPHEX_CLAUDE_PROVIDER", "").strip().lower()
+    if not env_provider:
+        return "default"
+    if env_provider not in VALID_CLAUDE_PROVIDERS:
+        raise ValueError(f"invalid RALPHEX_CLAUDE_PROVIDER: {env_provider!r} (valid: {', '.join(VALID_CLAUDE_PROVIDERS)})")
+    return env_provider
+
+
+@dataclasses.dataclass
+class ParsedEnvFlags:
+    """parsed result from docker -e flags."""
+    values: dict[str, str]  # var name -> value (resolved from os.environ for inherit form)
+    explicit: set[str]  # var names with explicit VAR=value form
+
+
+def parse_env_flags(extra_env: list[str] | None) -> ParsedEnvFlags:
+    """parse docker -e flags list into values dict and explicit names set.
+
+    parses ["-e", "VAR=value", "-e", "VAR2", ...] format.
+    for inherit-form entries (just "VAR"), resolves value from os.environ.
+    tracks which vars were set with explicit values (VAR=value form).
+    """
+    values: dict[str, str] = {}
+    explicit: set[str] = set()
+    if not extra_env:
+        return ParsedEnvFlags(values, explicit)
+    i = 0
+    while i < len(extra_env):
+        if extra_env[i] == "-e" and i + 1 < len(extra_env):
+            entry = extra_env[i + 1]
+            if "=" in entry:
+                var_name, value = entry.split("=", 1)
+                values[var_name] = value
+                explicit.add(var_name)
+            else:
+                # inherit form: use current env value if set
+                if entry in os.environ:
+                    values[entry] = os.environ[entry]
+            i += 2
+        else:
+            i += 1
+    return ParsedEnvFlags(values, explicit)
+
+
+def build_bedrock_env_args(existing_env: list[str] | None = None) -> list[str]:
+    """build docker -e flags for bedrock env vars that are actually set.
+
+    always sets CLAUDE_CODE_USE_BEDROCK=1 (since this function is only called when
+    bedrock provider is explicitly selected). other vars are passed through only
+    if they have values in the host environment.
+    skips vars that are already explicitly set in existing_env (from -E flags).
+    """
+    parsed = parse_env_flags(existing_env)
+    already_set = set(parsed.values.keys())
+
+    result: list[str] = []
+
+    # always set CLAUDE_CODE_USE_BEDROCK=1 when bedrock provider is selected
+    # (this function is only called when user explicitly chose bedrock)
+    if "CLAUDE_CODE_USE_BEDROCK" not in already_set:
+        result.extend(["-e", "CLAUDE_CODE_USE_BEDROCK=1"])
+
+    # check if user is providing explicit credential VALUES via -E VAR=value flags
+    # if so, we should NOT inherit any session token from host env to avoid mixing
+    # credentials from different sources (e.g., stale session token with new key/secret)
+    # NOTE: inherit form (-E VAR) means user wants host values, so we should pass session token too
+    user_provides_explicit_creds = "AWS_ACCESS_KEY_ID" in parsed.explicit or "AWS_SECRET_ACCESS_KEY" in parsed.explicit
+    skip_session_token = user_provides_explicit_creds and "AWS_SESSION_TOKEN" not in already_set
+
+    for var in BEDROCK_ENV_VARS:
+        # skip vars that are already set via -E flags
+        if var in already_set:
+            continue
+        # skip CLAUDE_CODE_USE_BEDROCK - already handled above with explicit =1
+        if var == "CLAUDE_CODE_USE_BEDROCK":
+            continue
+        # skip session token when user provides explicit credential values to avoid mixing
+        if skip_session_token and var == "AWS_SESSION_TOKEN":
+            continue
+        # only pass vars that exist in env AND have non-empty values
+        value = os.environ.get(var, "")
+        if value:
+            result.extend(["-e", var])
+    return result
+
+
+def export_aws_profile_credentials(extra_env: list[str] | None = None) -> dict[str, str]:
+    """export AWS credentials from profile using aws configure export-credentials.
+
+    returns dict with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally
+    AWS_SESSION_TOKEN extracted from the profile. returns empty dict if:
+    - explicit credentials (AWS_ACCESS_KEY_ID) are already set (in os.environ or extra_env)
+    - AWS_PROFILE is not set
+    - aws CLI is not available
+    - aws cli command fails
+    """
+    # extract env vars from -E flags to check for explicit credentials
+    env_from_flags = extract_env_from_flags(extra_env)
+
+    # skip if explicit credentials are already set (in os.environ or via -E flags)
+    if os.environ.get("AWS_ACCESS_KEY_ID") or "AWS_ACCESS_KEY_ID" in env_from_flags:
+        return {}
+
+    # skip if no profile is set (check both os.environ and -E flags)
+    profile = env_from_flags.get("AWS_PROFILE") if "AWS_PROFILE" in env_from_flags else os.environ.get("AWS_PROFILE", "")
+    profile = profile.strip() if profile else ""
+    if not profile:
+        return {}
+
+    # check if aws CLI is available (only needed when profile is set)
+    if shutil.which("aws") is None:
+        print("warning: aws CLI not found, cannot export profile credentials", file=sys.stderr)
+        return {}
+
+    # run aws configure export-credentials
+    try:
+        import json
+        result = subprocess.run(
+            ["aws", "configure", "export-credentials", "--profile", profile, "--format", "json"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if result.stderr else "unknown error"
+            print(f"warning: failed to export credentials from profile {profile}: {stderr}", file=sys.stderr)
+            return {}
+
+        # parse JSON output
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            print(f"warning: failed to parse credentials JSON: {e}", file=sys.stderr)
+            return {}
+
+        creds: dict[str, str] = {}
+        if "AccessKeyId" in data:
+            creds["AWS_ACCESS_KEY_ID"] = data["AccessKeyId"]
+        if "SecretAccessKey" in data:
+            creds["AWS_SECRET_ACCESS_KEY"] = data["SecretAccessKey"]
+        if "SessionToken" in data:
+            creds["AWS_SESSION_TOKEN"] = data["SessionToken"]
+        return creds
+    except OSError as e:
+        print(f"warning: failed to run aws CLI: {e}", file=sys.stderr)
+        return {}
+
+
+def extract_env_from_flags(extra_env: list[str] | None) -> dict[str, str]:
+    """extract env vars from docker -e flags list.
+
+    parses ["-e", "VAR=value", "-e", "VAR2", ...] into dict.
+    for inherit-form entries (just "VAR"), uses os.environ value.
+    """
+    return parse_env_flags(extra_env).values
+
+
+def validate_bedrock_config(extra_env: list[str] | None = None) -> list[str]:
+    """validate bedrock configuration and return list of warning messages.
+
+    checks for common misconfigurations when using bedrock provider:
+    - AWS_REGION should be set
+    - either AWS_PROFILE or AWS_ACCESS_KEY_ID should be set for credentials
+
+    note: CLAUDE_CODE_USE_BEDROCK is auto-set to 1 when bedrock provider is selected.
+    considers both os.environ and values from extra_env (CLI -E flags).
+    """
+    warnings: list[str] = []
+
+    # merge os.environ with extra_env flags (extra_env takes precedence)
+    env_from_flags = extract_env_from_flags(extra_env)
+
+    def get_val(key: str) -> str:
+        """get value from extra_env flags first, then os.environ.
+
+        note: explicit empty values in extra_env (VAR=) take precedence over os.environ.
+        """
+        if key in env_from_flags:
+            return env_from_flags[key]  # may be empty string if explicitly set
+        return os.environ.get(key, "")
+
+    # check AWS_REGION
+    if not get_val("AWS_REGION"):
+        warnings.append("AWS_REGION not set (required for Bedrock)")
+
+    # check for credentials source (profile, explicit key/secret, or bearer token)
+    has_profile = bool(get_val("AWS_PROFILE").strip())
+    has_access_key = bool(get_val("AWS_ACCESS_KEY_ID"))
+    has_secret_key = bool(get_val("AWS_SECRET_ACCESS_KEY"))
+    has_bearer_token = bool(get_val("AWS_BEARER_TOKEN_BEDROCK"))
+    if not has_profile and not has_access_key and not has_bearer_token:
+        warnings.append("no AWS credentials found (set AWS_PROFILE, AWS_ACCESS_KEY_ID, or AWS_BEARER_TOKEN_BEDROCK)")
+    elif has_access_key and not has_secret_key:
+        warnings.append("AWS_ACCESS_KEY_ID set but AWS_SECRET_ACCESS_KEY missing")
+
+    return warnings
+
+
 def handle_update(image: str) -> int:
     """pull latest docker image."""
     print(f"pulling latest image: {image}", file=sys.stderr)
@@ -635,16 +870,24 @@ def main() -> int:
     else:
         claude_home = Path.home() / ".claude"
 
+    # get claude provider early (needed for --help and directory checks)
+    try:
+        provider = get_claude_provider(parsed.claude_provider)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
     # handle --help: show wrapper help unconditionally, then try container help if config exists
+    # skip claude_home check when using bedrock provider (no anthropic credentials needed)
     if parsed.help:
         parser.print_help()
         print("\n" + "-" * 70)
-        if not claude_home.is_dir():
+        if provider != "bedrock" and not claude_home.is_dir():
             print("ralphex options: (cannot show - claude config not found)")
             print("  run 'claude' first to authenticate, then re-run --help")
             return 0
         print("ralphex options (from container):\n")
-        creds_temp = extract_macos_credentials(claude_home)
+        creds_temp = None if provider == "bedrock" else extract_macos_credentials(claude_home)
         try:
             volumes = build_volumes(creds_temp, claude_home)
             cmd = ["docker", "run", "--rm"]
@@ -661,15 +904,30 @@ def main() -> int:
                     pass
 
     # check required directories (after --help handling)
-    if not claude_home.is_dir():
+    # skip claude_home check when using bedrock provider (no anthropic credentials needed)
+    if provider != "bedrock" and not claude_home.is_dir():
         print(f"error: {claude_home} directory not found (run 'claude' first to authenticate)", file=sys.stderr)
         return 1
 
     # extract macOS credentials (needed for volume mounts)
-    creds_temp = extract_macos_credentials(claude_home)
+    # skip when using bedrock provider (uses AWS credentials instead)
+    creds_temp = None if provider == "bedrock" else extract_macos_credentials(claude_home)
 
     # merge env var entries with CLI -E/--env flags (env first, CLI appends)
     extra_env = merge_env_flags(parsed.env)
+
+    # add bedrock env vars when using bedrock provider
+    bedrock_env_args: list[str] = []  # track for diagnostics
+    if provider == "bedrock":
+        # export credentials from AWS profile if profile is set and explicit creds are not
+        # pass extra_env so it skips export when user provides explicit -E credentials
+        exported_creds = export_aws_profile_credentials(extra_env)
+        for key, value in exported_creds.items():
+            # set in environment so build_bedrock_env_args() picks them up
+            os.environ[key] = value
+        # pass existing extra_env to avoid overriding user's explicit -E values
+        bedrock_env_args = build_bedrock_env_args(extra_env)
+        extra_env.extend(bedrock_env_args)
 
     # merge env var entries with CLI -v/--volume flags (env first, CLI appends)
     extra_volumes = merge_volume_flags(parsed.volume)
@@ -702,6 +960,27 @@ def main() -> int:
         if claude_config_dir_env:
             print(f"using claude config dir: {claude_home}", file=sys.stderr)
         print(f"using image: {image}", file=sys.stderr)
+        if provider == "bedrock":
+            print("claude provider: bedrock (keychain skipped)", file=sys.stderr)
+            # extract env from flags for diagnostics
+            env_from_flags = extract_env_from_flags(extra_env)
+            # show credential source
+            if exported_creds:
+                profile = os.environ.get("AWS_PROFILE", "")
+                print(f"  exporting credentials from profile: {profile}", file=sys.stderr)
+            elif os.environ.get("AWS_ACCESS_KEY_ID") or "AWS_ACCESS_KEY_ID" in env_from_flags:
+                print("  using explicit credentials", file=sys.stderr)
+            # show which bedrock env vars are actually being passed
+            # combine: vars from build_bedrock_env_args + bedrock vars from -E flags
+            passed_from_auto = [bedrock_env_args[i + 1] for i in range(0, len(bedrock_env_args), 2) if bedrock_env_args[i] == "-e"]
+            passed_from_flags = [var for var in BEDROCK_ENV_VARS if var in env_from_flags]
+            passed_vars = sorted(set(passed_from_auto + passed_from_flags), key=lambda v: BEDROCK_ENV_VARS.index(v) if v in BEDROCK_ENV_VARS else len(BEDROCK_ENV_VARS))
+            if passed_vars:
+                print(f"  passing: {', '.join(passed_vars)}", file=sys.stderr)
+            # validate bedrock config and print warnings (pass extra_env to check -E flags too)
+            bedrock_warnings = validate_bedrock_config(extra_env)
+            for warning in bedrock_warnings:
+                print(f"  warning: {warning}", file=sys.stderr)
 
         # schedule credential cleanup
         schedule_cleanup(creds_temp)
@@ -719,6 +998,34 @@ def main() -> int:
 
 def run_tests() -> None:
     """run embedded unit tests."""
+
+    class EnvTestCase(unittest.TestCase):
+        """base class for tests that modify environment variables.
+
+        subclasses should set:
+        - env_vars: list of env var names to save/clear before each test
+        - save_argv: True to also save/restore sys.argv
+        """
+
+        env_vars: list[str] = []
+        save_argv: bool = False
+
+        def setUp(self) -> None:
+            self._saved_env: dict[str, str | None] = {}
+            for key in self.env_vars:
+                self._saved_env[key] = os.environ.get(key)
+                os.environ.pop(key, None)
+            if self.save_argv:
+                self._saved_argv = sys.argv[:]
+
+        def tearDown(self) -> None:
+            for key, val in self._saved_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+            if self.save_argv:
+                sys.argv[:] = self._saved_argv
 
     class TestResolvePath(unittest.TestCase):
         def test_regular_path(self) -> None:
@@ -1244,16 +1551,8 @@ def run_tests() -> None:
             self.assertFalse(is_sensitive_name("AUTHX"))  # AUTH at start but no right boundary
             self.assertFalse(is_sensitive_name("XAUTH"))  # AUTH at end but no left boundary
 
-    class TestBuildEnvVars(unittest.TestCase):
-        def setUp(self) -> None:
-            self._old_extra_env = os.environ.get("RALPHEX_EXTRA_ENV")
-            os.environ.pop("RALPHEX_EXTRA_ENV", None)
-
-        def tearDown(self) -> None:
-            if self._old_extra_env is None:
-                os.environ.pop("RALPHEX_EXTRA_ENV", None)
-            else:
-                os.environ["RALPHEX_EXTRA_ENV"] = self._old_extra_env
+    class TestBuildEnvVars(EnvTestCase):
+        env_vars = ["RALPHEX_EXTRA_ENV"]
 
         def test_extra_env_with_explicit_values(self) -> None:
             """RALPHEX_EXTRA_ENV with explicit values builds -e flags."""
@@ -1311,16 +1610,8 @@ def run_tests() -> None:
             warning = captured.getvalue()
             self.assertEqual(warning, "")
 
-    class TestMergeEnvFlags(unittest.TestCase):
-        def setUp(self) -> None:
-            self._old_extra_env = os.environ.get("RALPHEX_EXTRA_ENV")
-            os.environ.pop("RALPHEX_EXTRA_ENV", None)
-
-        def tearDown(self) -> None:
-            if self._old_extra_env is None:
-                os.environ.pop("RALPHEX_EXTRA_ENV", None)
-            else:
-                os.environ["RALPHEX_EXTRA_ENV"] = self._old_extra_env
+    class TestMergeEnvFlags(EnvTestCase):
+        env_vars = ["RALPHEX_EXTRA_ENV"]
 
         def test_env_only(self) -> None:
             """with only env var set, returns env var entries."""
@@ -1365,16 +1656,8 @@ def run_tests() -> None:
             result = merge_env_flags([])
             self.assertEqual(result, [])
 
-    class TestMergeVolumeFlags(unittest.TestCase):
-        def setUp(self) -> None:
-            self._old_extra_volumes = os.environ.get("RALPHEX_EXTRA_VOLUMES")
-            os.environ.pop("RALPHEX_EXTRA_VOLUMES", None)
-
-        def tearDown(self) -> None:
-            if self._old_extra_volumes is None:
-                os.environ.pop("RALPHEX_EXTRA_VOLUMES", None)
-            else:
-                os.environ["RALPHEX_EXTRA_VOLUMES"] = self._old_extra_volumes
+    class TestMergeVolumeFlags(EnvTestCase):
+        env_vars = ["RALPHEX_EXTRA_VOLUMES"]
 
         def test_env_only(self) -> None:
             """with only env var set, returns env var entries."""
@@ -1556,26 +1839,11 @@ def run_tests() -> None:
             self.assertFalse(args.update_script)
             self.assertEqual(unknown, ["--up"])
 
-    class TestMainArgparse(unittest.TestCase):
+    class TestMainArgparse(EnvTestCase):
         """tests for main() argparse integration."""
-
-        def setUp(self) -> None:
-            """save environment and mock external dependencies."""
-            self._saved_env: dict[str, str | None] = {}
-            for key in ["RALPHEX_IMAGE", "RALPHEX_PORT", "RALPHEX_EXTRA_ENV",
-                        "RALPHEX_EXTRA_VOLUMES", "CLAUDE_CONFIG_DIR"]:
-                self._saved_env[key] = os.environ.get(key)
-                os.environ.pop(key, None)
-            self._saved_argv = sys.argv[:]
-
-        def tearDown(self) -> None:
-            """restore environment and sys.argv."""
-            for key, val in self._saved_env.items():
-                if val is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = val
-            sys.argv[:] = self._saved_argv
+        env_vars = ["RALPHEX_IMAGE", "RALPHEX_PORT", "RALPHEX_EXTRA_ENV",
+                    "RALPHEX_EXTRA_VOLUMES", "CLAUDE_CONFIG_DIR"]
+        save_argv = True
 
         def test_update_flag_triggers_handle_update(self) -> None:
             """--update calls handle_update with image."""
@@ -1802,25 +2070,10 @@ def run_tests() -> None:
             finally:
                 shutil.rmtree(tmp)
 
-    class TestHelpFlag(unittest.TestCase):
+    class TestHelpFlag(EnvTestCase):
         """tests for --help flag handling."""
-
-        def setUp(self) -> None:
-            """save environment."""
-            self._saved_env: dict[str, str | None] = {}
-            for key in ["RALPHEX_IMAGE", "CLAUDE_CONFIG_DIR"]:
-                self._saved_env[key] = os.environ.get(key)
-                os.environ.pop(key, None)
-            self._saved_argv = sys.argv[:]
-
-        def tearDown(self) -> None:
-            """restore environment and sys.argv."""
-            for key, val in self._saved_env.items():
-                if val is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = val
-            sys.argv[:] = self._saved_argv
+        env_vars = ["RALPHEX_IMAGE", "CLAUDE_CONFIG_DIR", "RALPHEX_CLAUDE_PROVIDER"]
+        save_argv = True
 
         def test_help_without_claude_config_shows_wrapper_help(self) -> None:
             """--help shows wrapper help even when claude config is missing."""
@@ -1937,6 +2190,618 @@ def run_tests() -> None:
             output = "\n".join(captured_output)
             self.assertIn("cannot show - claude config not found", output)
 
+    class TestClaudeProvider(EnvTestCase):
+        """tests for claude provider selection and bedrock env var handling."""
+        env_vars = ["RALPHEX_CLAUDE_PROVIDER"] + BEDROCK_ENV_VARS
+
+        def test_default_provider_no_bedrock_env(self) -> None:
+            """no flag, no env → provider is 'default', bedrock args only has USE_BEDROCK=1."""
+            provider = get_claude_provider(None)
+            self.assertEqual(provider, "default")
+            # build_bedrock_env_args always sets CLAUDE_CODE_USE_BEDROCK=1
+            args = build_bedrock_env_args()
+            self.assertEqual(args, ["-e", "CLAUDE_CODE_USE_BEDROCK=1"])
+
+        def test_cli_flag_bedrock(self) -> None:
+            """--claude-provider bedrock → provider is 'bedrock'."""
+            provider = get_claude_provider("bedrock")
+            self.assertEqual(provider, "bedrock")
+
+        def test_env_var_fallback(self) -> None:
+            """no flag, RALPHEX_CLAUDE_PROVIDER=bedrock → provider is 'bedrock'."""
+            os.environ["RALPHEX_CLAUDE_PROVIDER"] = "bedrock"
+            provider = get_claude_provider(None)
+            self.assertEqual(provider, "bedrock")
+
+        def test_cli_overrides_env(self) -> None:
+            """flag and env var set → CLI wins."""
+            os.environ["RALPHEX_CLAUDE_PROVIDER"] = "bedrock"
+            provider = get_claude_provider("default")
+            self.assertEqual(provider, "default")
+            # also test the reverse
+            os.environ["RALPHEX_CLAUDE_PROVIDER"] = "default"
+            provider = get_claude_provider("bedrock")
+            self.assertEqual(provider, "bedrock")
+
+        def test_bedrock_passes_set_vars(self) -> None:
+            """only passes BEDROCK_ENV_VARS that are actually set."""
+            os.environ["AWS_REGION"] = "us-east-1"
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            # AWS_SECRET_ACCESS_KEY is NOT set
+            args = build_bedrock_env_args()
+            self.assertIn("-e", args)
+            self.assertIn("AWS_REGION", args)
+            self.assertIn("AWS_ACCESS_KEY_ID", args)
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", args)
+
+        def test_bedrock_skips_user_overrides(self) -> None:
+            """skips vars already set via -E flags to avoid overriding user values."""
+            os.environ["AWS_REGION"] = "us-east-1"
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            # user explicitly sets AWS_REGION via -E flag
+            existing_env = ["-e", "AWS_REGION=eu-west-1"]
+            args = build_bedrock_env_args(existing_env)
+            # AWS_REGION should be skipped (user override), AWS_ACCESS_KEY_ID should be added
+            self.assertNotIn("AWS_REGION", args)
+            self.assertIn("AWS_ACCESS_KEY_ID", args)
+
+        def test_bedrock_skips_user_inherit(self) -> None:
+            """skips vars already set via -E VAR (inherit form) to avoid duplicates."""
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+            # user explicitly passes AWS_ACCESS_KEY_ID via -E flag (inherit form)
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID"]
+            args = build_bedrock_env_args(existing_env)
+            # AWS_ACCESS_KEY_ID should be skipped, AWS_SECRET_ACCESS_KEY should be added
+            self.assertNotIn("AWS_ACCESS_KEY_ID", args)
+            self.assertIn("AWS_SECRET_ACCESS_KEY", args)
+
+        def test_inherit_form_passes_session_token(self) -> None:
+            """inherit form -E VAR passes session token from host (for STS creds)."""
+            os.environ["AWS_ACCESS_KEY_ID"] = "ASIATEST"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+            os.environ["AWS_SESSION_TOKEN"] = "token123"
+            # user uses inherit form for credentials (expects all three from host)
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID", "-e", "AWS_SECRET_ACCESS_KEY"]
+            args = build_bedrock_env_args(existing_env)
+            # session token should be passed since user is inheriting host creds
+            self.assertIn("AWS_SESSION_TOKEN", args)
+
+        def test_explicit_form_skips_session_token(self) -> None:
+            """explicit form -E VAR=value skips host session token to avoid mixing."""
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIAOLD"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "oldsecret"
+            os.environ["AWS_SESSION_TOKEN"] = "stale-token"
+            # user provides explicit new credentials
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID=AKIANEW", "-e", "AWS_SECRET_ACCESS_KEY=newsecret"]
+            args = build_bedrock_env_args(existing_env)
+            # session token should NOT be passed (would be stale from different creds)
+            self.assertNotIn("AWS_SESSION_TOKEN", args)
+
+        def test_mixed_form_uses_explicit_logic(self) -> None:
+            """if any credential has explicit value, skip session token."""
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+            os.environ["AWS_SESSION_TOKEN"] = "token123"
+            # user provides explicit access key but inherits secret (unusual but possible)
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID=NEWKEY", "-e", "AWS_SECRET_ACCESS_KEY"]
+            args = build_bedrock_env_args(existing_env)
+            # session token should NOT be passed (explicit key means new credential source)
+            self.assertNotIn("AWS_SESSION_TOKEN", args)
+
+        def test_explicit_session_token_always_honored(self) -> None:
+            """explicit -E AWS_SESSION_TOKEN always passes through."""
+            os.environ["AWS_SESSION_TOKEN"] = "host-token"
+            # user explicitly provides session token (regardless of cred form)
+            existing_env = ["-e", "AWS_ACCESS_KEY_ID=KEY", "-e", "AWS_SESSION_TOKEN=explicit-token"]
+            args = build_bedrock_env_args(existing_env)
+            # explicit session token is not in result (already in existing_env)
+            # but importantly, skip_session_token logic doesn't remove it
+            self.assertNotIn("AWS_SESSION_TOKEN", args)  # already in existing_env, so skipped
+
+        def test_invalid_provider_rejected(self) -> None:
+            """unknown provider value → error."""
+            os.environ["RALPHEX_CLAUDE_PROVIDER"] = "invalid"
+            with self.assertRaises(ValueError) as ctx:
+                get_claude_provider(None)
+            self.assertIn("invalid", str(ctx.exception))
+            self.assertIn("RALPHEX_CLAUDE_PROVIDER", str(ctx.exception))
+
+        def test_env_var_case_insensitive(self) -> None:
+            """env var value is case-insensitive."""
+            os.environ["RALPHEX_CLAUDE_PROVIDER"] = "BEDROCK"
+            provider = get_claude_provider(None)
+            self.assertEqual(provider, "bedrock")
+            os.environ["RALPHEX_CLAUDE_PROVIDER"] = "Bedrock"
+            provider = get_claude_provider(None)
+            self.assertEqual(provider, "bedrock")
+
+        def test_env_var_whitespace_trimmed(self) -> None:
+            """env var value whitespace is trimmed."""
+            os.environ["RALPHEX_CLAUDE_PROVIDER"] = "  bedrock  "
+            provider = get_claude_provider(None)
+            self.assertEqual(provider, "bedrock")
+
+        def test_empty_env_var_defaults(self) -> None:
+            """empty env var falls back to default."""
+            os.environ["RALPHEX_CLAUDE_PROVIDER"] = ""
+            provider = get_claude_provider(None)
+            self.assertEqual(provider, "default")
+
+    class TestAwsCredentialExport(EnvTestCase):
+        """tests for AWS profile credential export."""
+        env_vars = ["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+
+        def test_exports_credentials_with_profile(self) -> None:
+            """AWS_PROFILE set → runs aws cli, parses JSON output."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+            json_output = '{"AccessKeyId": "AKIATEST", "SecretAccessKey": "secret123", "SessionToken": "tok123"}'
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = json_output
+                mock_result.stderr = ""
+                return mock_result
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds["AWS_ACCESS_KEY_ID"], "AKIATEST")
+            self.assertEqual(creds["AWS_SECRET_ACCESS_KEY"], "secret123")
+            self.assertEqual(creds["AWS_SESSION_TOKEN"], "tok123")
+
+        def test_skips_export_when_explicit_creds(self) -> None:
+            """AWS_ACCESS_KEY_ID set → no aws cli call."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIAEXPLICIT"
+
+            call_count = [0]
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                call_count[0] += 1
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = "{}"
+                return mock_result
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            self.assertEqual(call_count[0], 0)
+
+        def test_skips_export_when_no_profile(self) -> None:
+            """AWS_PROFILE not set → no aws cli call."""
+            call_count = [0]
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                call_count[0] += 1
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = "{}"
+                return mock_result
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            self.assertEqual(call_count[0], 0)
+
+        def test_handles_export_failure(self) -> None:
+            """aws cli fails → empty dict, no crash."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 1
+                mock_result.stdout = ""
+                mock_result.stderr = "profile not found"
+                return mock_result
+
+            import io
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured):
+                with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                    with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                        creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            warning = captured.getvalue()
+            self.assertIn("warning:", warning)
+            self.assertIn("test-profile", warning)
+
+        def test_handles_missing_aws_cli(self) -> None:
+            """aws CLI not installed → empty dict, warning logged."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            import io
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured):
+                with unittest.mock.patch("shutil.which", return_value=None):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            warning = captured.getvalue()
+            self.assertIn("warning:", warning)
+            self.assertIn("aws CLI not found", warning)
+
+        def test_parses_json_output(self) -> None:
+            """correctly extracts AccessKeyId/SecretAccessKey/SessionToken from JSON."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            # test with minimal output (no session token)
+            json_output = '{"AccessKeyId": "AKIA123", "SecretAccessKey": "secret456"}'
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = json_output
+                mock_result.stderr = ""
+                return mock_result
+
+            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                    creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds["AWS_ACCESS_KEY_ID"], "AKIA123")
+            self.assertEqual(creds["AWS_SECRET_ACCESS_KEY"], "secret456")
+            self.assertNotIn("AWS_SESSION_TOKEN", creds)
+
+        def test_handles_invalid_json(self) -> None:
+            """invalid JSON output → empty dict, warning logged."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            def fake_run(cmd: list[str], **kwargs: object) -> unittest.mock.Mock:
+                mock_result = unittest.mock.Mock()
+                mock_result.returncode = 0
+                mock_result.stdout = "not valid json"
+                mock_result.stderr = ""
+                return mock_result
+
+            import io
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured):
+                with unittest.mock.patch("subprocess.run", side_effect=fake_run):
+                    with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                        creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            warning = captured.getvalue()
+            self.assertIn("warning:", warning)
+            self.assertIn("parse credentials JSON", warning)
+
+        def test_handles_oserror_from_subprocess(self) -> None:
+            """subprocess.run raises OSError → empty dict, warning logged."""
+            os.environ["AWS_PROFILE"] = "test-profile"
+
+            import io
+            captured = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured):
+                with unittest.mock.patch("subprocess.run", side_effect=OSError("cannot execute")):
+                    with unittest.mock.patch("shutil.which", return_value="/usr/bin/aws"):
+                        creds = export_aws_profile_credentials()
+
+            self.assertEqual(creds, {})
+            warning = captured.getvalue()
+            self.assertIn("warning:", warning)
+            self.assertIn("failed to run aws CLI", warning)
+
+    class TestBedrockSkipKeychain(EnvTestCase):
+        """tests for bedrock mode skipping keychain and claude_home checks."""
+        env_vars = ["RALPHEX_CLAUDE_PROVIDER"] + BEDROCK_ENV_VARS
+        save_argv = True
+
+        def test_skips_credentials_extraction_when_bedrock(self) -> None:
+            """bedrock provider skips extract_macos_credentials (creds_temp is None)."""
+            captured_creds_temp: list[object] = []
+
+            def fake_run_docker(
+                image: str, port: int, volumes: list[str], extra_env: list[str],
+                bind_port: bool, ralphex_args: list[str]
+            ) -> int:
+                # capture what we need via side effect - creds_temp should be None for bedrock
+                return 0
+
+            extract_calls = [0]
+
+            def fake_extract(claude_home: Path) -> Optional[Path]:
+                extract_calls[0] += 1
+                return None
+
+            import io
+            captured_stderr = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured_stderr):
+                with unittest.mock.patch("__main__.run_docker", side_effect=fake_run_docker):
+                    with unittest.mock.patch("__main__.extract_macos_credentials", side_effect=fake_extract):
+                        with unittest.mock.patch("__main__.export_aws_profile_credentials", return_value={}):
+                            sys.argv = ["ralphex-dk", "--claude-provider", "bedrock", "plan.md"]
+                            result = main()
+
+            self.assertEqual(result, 0)
+            # extract_macos_credentials should NOT be called for bedrock
+            self.assertEqual(extract_calls[0], 0)
+
+        def test_skips_claude_home_check_when_bedrock(self) -> None:
+            """bedrock provider skips claude_home.is_dir() check - no error if ~/.claude missing."""
+            import io
+            captured_stderr = io.StringIO()
+
+            def fake_run_docker(
+                image: str, port: int, volumes: list[str], extra_env: list[str],
+                bind_port: bool, ralphex_args: list[str]
+            ) -> int:
+                return 0
+
+            # use a non-existent claude home path
+            with tempfile.TemporaryDirectory() as tmpdir:
+                fake_claude_home = Path(tmpdir) / "nonexistent_claude"
+                # do NOT create the directory
+
+                with unittest.mock.patch("sys.stderr", captured_stderr):
+                    with unittest.mock.patch("__main__.run_docker", side_effect=fake_run_docker):
+                        with unittest.mock.patch("__main__.extract_macos_credentials", return_value=None):
+                            with unittest.mock.patch("__main__.export_aws_profile_credentials", return_value={}):
+                                # mock Path.home to return our temp dir so claude_home resolves to nonexistent
+                                with unittest.mock.patch.object(Path, "home", return_value=Path(tmpdir)):
+                                    sys.argv = ["ralphex-dk", "--claude-provider", "bedrock", "plan.md"]
+                                    result = main()
+
+            self.assertEqual(result, 0)
+            # should NOT see "directory not found" error
+            self.assertNotIn("directory not found", captured_stderr.getvalue())
+
+        def test_normal_mode_still_extracts_credentials(self) -> None:
+            """default provider still calls extract_macos_credentials for backwards compat."""
+            extract_calls = [0]
+
+            def fake_extract(claude_home: Path) -> Optional[Path]:
+                extract_calls[0] += 1
+                return None
+
+            def fake_run_docker(
+                image: str, port: int, volumes: list[str], extra_env: list[str],
+                bind_port: bool, ralphex_args: list[str]
+            ) -> int:
+                return 0
+
+            import io
+            captured_stderr = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured_stderr):
+                with unittest.mock.patch("__main__.run_docker", side_effect=fake_run_docker):
+                    with unittest.mock.patch("__main__.extract_macos_credentials", side_effect=fake_extract):
+                        sys.argv = ["ralphex-dk", "plan.md"]
+                        result = main()
+
+            self.assertEqual(result, 0)
+            # extract_macos_credentials SHOULD be called for default provider
+            self.assertEqual(extract_calls[0], 1)
+
+        def test_startup_message_shows_bedrock_mode(self) -> None:
+            """startup output includes 'bedrock' and 'keychain skipped'."""
+            def fake_run_docker(
+                image: str, port: int, volumes: list[str], extra_env: list[str],
+                bind_port: bool, ralphex_args: list[str]
+            ) -> int:
+                return 0
+
+            import io
+            captured_stderr = io.StringIO()
+            with unittest.mock.patch("sys.stderr", captured_stderr):
+                with unittest.mock.patch("__main__.run_docker", side_effect=fake_run_docker):
+                    with unittest.mock.patch("__main__.extract_macos_credentials", return_value=None):
+                        with unittest.mock.patch("__main__.export_aws_profile_credentials", return_value={}):
+                            sys.argv = ["ralphex-dk", "--claude-provider", "bedrock", "plan.md"]
+                            result = main()
+
+            self.assertEqual(result, 0)
+            output = captured_stderr.getvalue()
+            self.assertIn("bedrock", output.lower())
+            self.assertIn("keychain skipped", output.lower())
+
+    class TestBedrockValidation(EnvTestCase):
+        """tests for validate_bedrock_config() function."""
+        env_vars = ["CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_PROFILE",
+                    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_BEARER_TOKEN_BEDROCK"]
+
+        def test_warns_missing_aws_region(self) -> None:
+            """warns when AWS_REGION is not set."""
+            # set other vars, but not AWS_REGION
+            os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+
+            warnings = validate_bedrock_config()
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("AWS_REGION", warnings[0])
+
+        def test_warns_no_credentials_found(self) -> None:
+            """warns when neither AWS_PROFILE nor AWS_ACCESS_KEY_ID is set."""
+            os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            os.environ["AWS_REGION"] = "us-east-1"
+            # no credentials set
+
+            warnings = validate_bedrock_config()
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("no AWS credentials found", warnings[0])
+
+        def test_no_warning_with_profile(self) -> None:
+            """no credential warning when AWS_PROFILE is set."""
+            os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            os.environ["AWS_REGION"] = "us-east-1"
+            os.environ["AWS_PROFILE"] = "my-profile"
+
+            warnings = validate_bedrock_config()
+
+            self.assertEqual(len(warnings), 0)
+
+        def test_no_warning_with_explicit_creds(self) -> None:
+            """no credential warning when both access key and secret key are set."""
+            os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            os.environ["AWS_REGION"] = "us-east-1"
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+
+            warnings = validate_bedrock_config()
+
+            self.assertEqual(len(warnings), 0)
+
+        def test_no_warning_with_bearer_token(self) -> None:
+            """no credential warning when AWS_BEARER_TOKEN_BEDROCK is set."""
+            os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            os.environ["AWS_REGION"] = "us-east-1"
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = "token123"
+
+            warnings = validate_bedrock_config()
+
+            self.assertEqual(len(warnings), 0)
+
+        def test_warns_missing_secret_key(self) -> None:
+            """warns when AWS_ACCESS_KEY_ID is set but AWS_SECRET_ACCESS_KEY is missing."""
+            os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            os.environ["AWS_REGION"] = "us-east-1"
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            # AWS_SECRET_ACCESS_KEY is NOT set
+
+            warnings = validate_bedrock_config()
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("AWS_SECRET_ACCESS_KEY", warnings[0])
+
+        def test_no_warning_when_set_via_e_flag(self) -> None:
+            """no warning when vars are provided via -E flags."""
+            # nothing in os.environ
+            extra_env = [
+                "-e", "CLAUDE_CODE_USE_BEDROCK=1",
+                "-e", "AWS_REGION=us-east-1",
+                "-e", "AWS_ACCESS_KEY_ID=AKIATEST",
+                "-e", "AWS_SECRET_ACCESS_KEY=secret",
+            ]
+
+            warnings = validate_bedrock_config(extra_env)
+
+            self.assertEqual(len(warnings), 0)
+
+        def test_e_flag_overrides_env(self) -> None:
+            """values from -E flags take precedence over os.environ."""
+            # os.environ has empty/unset value
+            os.environ["CLAUDE_CODE_USE_BEDROCK"] = ""
+            # -E flag has proper value
+            extra_env = [
+                "-e", "CLAUDE_CODE_USE_BEDROCK=1",
+                "-e", "AWS_REGION=us-east-1",
+                "-e", "AWS_ACCESS_KEY_ID=AKIATEST",
+                "-e", "AWS_SECRET_ACCESS_KEY=secret",
+            ]
+
+            warnings = validate_bedrock_config(extra_env)
+
+            self.assertEqual(len(warnings), 0)
+
+        def test_inherit_form_uses_os_environ(self) -> None:
+            """inherit form (-e VAR) uses os.environ value."""
+            os.environ["AWS_ACCESS_KEY_ID"] = "AKIATEST"
+            os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+            extra_env = [
+                "-e", "CLAUDE_CODE_USE_BEDROCK=1",
+                "-e", "AWS_REGION=us-east-1",
+                "-e", "AWS_ACCESS_KEY_ID",  # inherit form
+                "-e", "AWS_SECRET_ACCESS_KEY",  # inherit form
+            ]
+
+            warnings = validate_bedrock_config(extra_env)
+
+            self.assertEqual(len(warnings), 0)
+
+    class TestParseEnvFlags(unittest.TestCase):
+        """tests for parse_env_flags() function."""
+
+        def test_empty_list(self) -> None:
+            """empty list returns empty values and explicit sets."""
+            result = parse_env_flags([])
+            self.assertEqual(result.values, {})
+            self.assertEqual(result.explicit, set())
+
+            result = parse_env_flags(None)
+            self.assertEqual(result.values, {})
+            self.assertEqual(result.explicit, set())
+
+        def test_assignment_form_is_explicit(self) -> None:
+            """VAR=value form is tracked as explicit."""
+            extra_env = ["-e", "AWS_REGION=us-east-1", "-e", "AWS_ACCESS_KEY_ID=AKIATEST"]
+            result = parse_env_flags(extra_env)
+            self.assertEqual(result.values["AWS_REGION"], "us-east-1")
+            self.assertEqual(result.values["AWS_ACCESS_KEY_ID"], "AKIATEST")
+            self.assertIn("AWS_REGION", result.explicit)
+            self.assertIn("AWS_ACCESS_KEY_ID", result.explicit)
+
+        def test_inherit_form_not_explicit(self) -> None:
+            """VAR form (inherit) is not tracked as explicit."""
+            os.environ["MY_VAR"] = "my_value"
+            try:
+                extra_env = ["-e", "MY_VAR"]
+                result = parse_env_flags(extra_env)
+                self.assertEqual(result.values["MY_VAR"], "my_value")
+                self.assertNotIn("MY_VAR", result.explicit)
+            finally:
+                os.environ.pop("MY_VAR", None)
+
+        def test_mixed_forms(self) -> None:
+            """mix of explicit and inherit forms."""
+            os.environ["INHERIT_VAR"] = "inherited"
+            try:
+                extra_env = ["-e", "EXPLICIT_VAR=explicit", "-e", "INHERIT_VAR"]
+                result = parse_env_flags(extra_env)
+                self.assertEqual(result.values["EXPLICIT_VAR"], "explicit")
+                self.assertEqual(result.values["INHERIT_VAR"], "inherited")
+                self.assertIn("EXPLICIT_VAR", result.explicit)
+                self.assertNotIn("INHERIT_VAR", result.explicit)
+            finally:
+                os.environ.pop("INHERIT_VAR", None)
+
+    class TestExtractEnvFromFlags(unittest.TestCase):
+        """tests for extract_env_from_flags() function."""
+
+        def test_empty_list(self) -> None:
+            """empty list returns empty dict."""
+            self.assertEqual(extract_env_from_flags([]), {})
+            self.assertEqual(extract_env_from_flags(None), {})
+
+        def test_assignment_form(self) -> None:
+            """parses VAR=value form."""
+            extra_env = ["-e", "AWS_REGION=us-east-1", "-e", "AWS_ACCESS_KEY_ID=AKIATEST"]
+            result = extract_env_from_flags(extra_env)
+            self.assertEqual(result["AWS_REGION"], "us-east-1")
+            self.assertEqual(result["AWS_ACCESS_KEY_ID"], "AKIATEST")
+
+        def test_inherit_form(self) -> None:
+            """parses VAR form (inherit from os.environ)."""
+            os.environ["MY_VAR"] = "my_value"
+            try:
+                extra_env = ["-e", "MY_VAR"]
+                result = extract_env_from_flags(extra_env)
+                self.assertEqual(result["MY_VAR"], "my_value")
+            finally:
+                os.environ.pop("MY_VAR", None)
+
+        def test_inherit_form_missing_env(self) -> None:
+            """inherit form skips vars not in os.environ."""
+            os.environ.pop("MISSING_VAR", None)
+            extra_env = ["-e", "MISSING_VAR"]
+            result = extract_env_from_flags(extra_env)
+            self.assertNotIn("MISSING_VAR", result)
+
+        def test_value_with_equals(self) -> None:
+            """values can contain equals signs."""
+            extra_env = ["-e", "MY_VAR=foo=bar=baz"]
+            result = extract_env_from_flags(extra_env)
+            self.assertEqual(result["MY_VAR"], "foo=bar=baz")
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for tc in [TestResolvePath, TestSymlinkTargetDirs, TestShouldBindPort, TestBuildVolumes,
@@ -1946,7 +2811,8 @@ def run_tests() -> None:
                TestExtractCredentialsClaudeHome, TestSelinuxEnabled, TestSelinuxVolumeSuffix,
                TestClaudeConfigDirEnv, TestIsSensitiveName, TestBuildEnvVars,
                TestMergeEnvFlags, TestMergeVolumeFlags, TestBuildParser,
-               TestMainArgparse, TestHelpFlag]:
+               TestMainArgparse, TestHelpFlag, TestClaudeProvider, TestAwsCredentialExport,
+               TestBedrockSkipKeychain, TestBedrockValidation, TestParseEnvFlags, TestExtractEnvFromFlags]:
         suite.addTests(loader.loadTestsFromTestCase(tc))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
