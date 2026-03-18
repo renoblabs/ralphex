@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.24.0 - 2026-03-17
+
+### New Features
+
+- Add session_timeout config option for hanging session safety net #225 @umputun
+
+### Fixed
+
+- Prevent infinite loop when checkboxes are outside Task sections #222 @romrigger
+- Fix progress output text wrapping and code smells #226 @umputun
+
 ## v0.23.0 - 2026-03-16
 
 ### New Features
