@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fatih/color"
 	flags "github.com/jessevdk/go-flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1923,7 +1924,7 @@ func TestDisplayStats(t *testing.T) {
 
 		req := executePlanRequest{PlanFile: "docs/plans/feature.md", Colors: colors}
 		stats := git.DiffStats{Files: 5, Additions: 200, Deletions: 50}
-		displayStats(req, baseLog, stats, "2m15s")
+		displayStats(req, baseLog, stats, "2m15s", "feature-branch")
 	})
 
 	t.Run("without_diff_stats", func(t *testing.T) {
@@ -1938,7 +1939,7 @@ func TestDisplayStats(t *testing.T) {
 		defer func() { _ = baseLog.Close() }()
 
 		req := executePlanRequest{Colors: colors}
-		displayStats(req, baseLog, git.DiffStats{}, "30s")
+		displayStats(req, baseLog, git.DiffStats{}, "30s", "main")
 	})
 
 	t.Run("with_main_plan_file", func(t *testing.T) {
@@ -1957,8 +1958,48 @@ func TestDisplayStats(t *testing.T) {
 			MainPlanFile: "docs/plans/feature.md",
 			Colors:       colors,
 		}
-		displayStats(req, baseLog, git.DiffStats{Files: 1, Additions: 10, Deletions: 5}, "10s")
+		displayStats(req, baseLog, git.DiffStats{Files: 1, Additions: 10, Deletions: 5}, "10s", "feature-wt")
 	})
+}
+
+func TestDisplayMeta(t *testing.T) {
+	tests := []struct {
+		name, planFile, branch, progressPath string
+		indent                               int
+		wantContains                         []string
+		wantNotContains                      []string
+	}{
+		{name: "no_indent_with_plan", indent: 0, planFile: "docs/plans/feature.md", branch: "feature-branch",
+			progressPath: ".ralphex/progress/progress-feature.txt",
+			wantContains: []string{"plan: docs/plans/feature.md", "branch: feature-branch", "progress log: .ralphex/progress/progress-feature.txt"}},
+		{name: "indented_with_plan", indent: 2, planFile: "docs/plans/feature.md", branch: "main",
+			progressPath: ".ralphex/progress/progress-feature.txt",
+			wantContains: []string{"  plan: docs/plans/feature.md", "  branch: main", "  progress log: .ralphex/progress/progress-feature.txt"}},
+		{name: "no_plan_file", indent: 0, planFile: "", branch: "develop",
+			progressPath:    ".ralphex/progress/progress.txt",
+			wantContains:    []string{"branch: develop", "progress log: .ralphex/progress/progress.txt"},
+			wantNotContains: []string{"plan:"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			colors := testColors()
+			var buf bytes.Buffer
+			origOutput := color.Output
+			color.Output = &buf
+			t.Cleanup(func() { color.Output = origOutput })
+
+			displayMeta(colors, tc.indent, tc.planFile, tc.branch, tc.progressPath)
+
+			out := buf.String()
+			for _, want := range tc.wantContains {
+				assert.Contains(t, out, want)
+			}
+			for _, notWant := range tc.wantNotContains {
+				assert.NotContains(t, out, notWant)
+			}
+		})
+	}
 }
 
 func TestKeepDashboardAlive(t *testing.T) {

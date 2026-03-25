@@ -450,7 +450,8 @@ func buildNotifyResult(req executePlanRequest, branch, elapsed string, stats git
 }
 
 // displayStats prints completion summary with optional diff statistics and paths.
-func displayStats(req executePlanRequest, baseLog *progress.Logger, stats git.DiffStats, elapsed string) {
+// mirrors the startup header format using displayMeta for plan/branch/progress.
+func displayStats(req executePlanRequest, baseLog *progress.Logger, stats git.DiffStats, elapsed, branch string) {
 	if stats.Files > 0 {
 		baseLog.LogDiffStats(stats.Files, stats.Additions, stats.Deletions)
 		req.Colors.Info().Printf("\ncompleted in %s (%d files, +%d/-%d lines)\n",
@@ -459,16 +460,26 @@ func displayStats(req executePlanRequest, baseLog *progress.Logger, stats git.Di
 		req.Colors.Info().Printf("\ncompleted in %s\n", elapsed)
 	}
 
-	// show paths for easy copy-paste after completion summary
+	planPath := ""
 	if req.PlanFile != "" {
 		planFile := req.PlanFile
 		if req.MainPlanFile != "" {
 			planFile = req.MainPlanFile
 		}
-		completedPlanPath := filepath.Join(filepath.Dir(planFile), "completed", filepath.Base(planFile))
-		req.Colors.Info().Printf("  plan: %s\n", completedPlanPath)
+		planPath = filepath.Join(filepath.Dir(planFile), "completed", filepath.Base(planFile))
 	}
-	req.Colors.Info().Printf("  progress: %s\n", baseLog.Path())
+	displayMeta(req.Colors, 2, planPath, branch, baseLog.Path())
+}
+
+// displayMeta prints plan (if set), branch, and progress log path with the given indent.
+// file paths are converted to relative for readability.
+func displayMeta(colors *progress.Colors, indent int, planFile, branch, progressPath string) {
+	pad := strings.Repeat(" ", indent)
+	if planFile != "" {
+		colors.Info().Printf("%splan: %s\n", pad, toRelPath(planFile))
+	}
+	colors.Info().Printf("%sbranch: %s\n", pad, branch)
+	colors.Info().Printf("%sprogress log: %s\n", pad, toRelPath(progressPath))
 }
 
 // keepDashboardAlive keeps the web dashboard running after execution completes.
@@ -572,7 +583,7 @@ func executePlan(ctx context.Context, o opts, req executePlanRequest) error {
 		}
 	}
 
-	displayStats(req, plr.baseLog, stats, elapsed)
+	displayStats(req, plr.baseLog, stats, elapsed, branch)
 	keepDashboardAlive(ctx, o, req, plr.closeLog)
 
 	return nil
@@ -890,7 +901,7 @@ func printStartupInfo(info startupInfo, colors *progress.Colors) {
 		colors.Info().Printf("starting interactive plan creation\n")
 		colors.Info().Printf("request: %s\n", info.PlanDescription)
 		colors.Info().Printf("branch: %s (max %d iterations)\n", info.Branch, info.MaxIterations)
-		colors.Info().Printf("progress log: %s\n\n", info.ProgressPath)
+		colors.Info().Printf("progress log: %s\n\n", toRelPath(info.ProgressPath))
 		return
 	}
 
@@ -899,11 +910,8 @@ func printStartupInfo(info startupInfo, colors *progress.Colors) {
 		modeStr = fmt.Sprintf(" (%s mode)", info.Mode)
 	}
 	colors.Info().Printf("starting ralphex loop (max %d iterations)%s\n", info.MaxIterations, modeStr)
-	if info.PlanFile != "" {
-		colors.Info().Printf("plan: %s\n", toRelPath(info.PlanFile))
-	}
-	colors.Info().Printf("branch: %s\n", info.Branch)
-	colors.Info().Printf("progress log: %s\n\n", info.ProgressPath)
+	displayMeta(colors, 0, info.PlanFile, info.Branch, info.ProgressPath)
+	colors.Info().Printf("\n")
 }
 
 // runPlanMode executes interactive plan creation mode.
