@@ -490,6 +490,7 @@ func (s *Service) EnsureIgnored(pattern, probePath string) error {
 	gitignorePath := filepath.Join(s.repo.root(), ".gitignore")
 	hasComment := false
 	endsWithNewline := true // assume true for new files (O_CREATE)
+
 	if existing, readErr := os.ReadFile(gitignorePath); readErr == nil { //nolint:gosec // .gitignore is world-readable
 		for line := range strings.SplitSeq(string(existing), "\n") {
 			trimmed := strings.TrimSpace(line)
