@@ -336,12 +336,14 @@ Implementation:
 
 ### Agent System
 
-5 default agents are installed on first run to `~/.config/ralphex/agents/`:
+5 default agents are installed on first run to `~/.config/ralphex/agents/` as commented-out templates:
 - `implementation.txt` - verifies code achieves stated goals
 - `quality.txt` - reviews for bugs, security issues, race conditions
 - `documentation.txt` - checks if docs need updates
 - `simplification.txt` - detects over-engineering
 - `testing.txt` - reviews test coverage and quality
+
+**Loading behavior:** agents are loaded with per-file fallback: local `.ralphex/agents/` → global `~/.config/ralphex/agents/` → embedded default. The 5 embedded agents are always the baseline — deleting an agent file from disk does not disable it, the embedded version is used as fallback. To disable a specific agent, remove its `{{agent:name}}` reference from the prompt files (`review_first.txt`, `review_second.txt`), not the agent file itself.
 
 **Frontmatter options:** Agent files support optional YAML frontmatter (`---` delimited) for per-agent model and subagent type:
 - `model: haiku|sonnet|opus` — Claude model for this agent
